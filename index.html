@@ -79,12 +79,142 @@ const LIST = [
   ...SP.map(n => ['idle-' + n, 'assets/sprites-diam/' + n + '.png']),
   ...UI.map(n => [n, 'assets/ui/' + n + '.png']),
 ];
+/* Cache gambar: Cache Storage menyimpan file gambar, localStorage menyimpan indeksnya.
+   Cache Storage dipakai untuk data gambar karena localStorage hanya cocok untuk metadata kecil. */
+const ASSET_CACHE_NAME = 'vn-statistika-assets-v1';
+const ASSET_META_KEY = 'vnStatistikaAssetMeta';
+let assetsReady = false;
 let loadedCount = 0;
-LIST.forEach(([key, src]) => {
-  const im = new Image();
-  im.onload = im.onerror = () => { if (++loadedCount === LIST.length) start(); };
-  im.src = src; IMG[key] = im;
-});
+const assetProgress = {
+  total: LIST.length,
+  done: 0,
+  fromCache: 0,
+  saved: 0,
+  items: LIST.map(([key, src]) => ({
+    key, src,
+    status: 'Menunggu',
+    done: false
+  }))
+};
+
+function assetLabel(key) {
+  return key.replace(/^idle-/, 'Diam - ')
+    .replace(/-/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function saveAssetMeta(key, src, cached) {
+  try {
+    const meta = JSON.parse(localStorage.getItem(ASSET_META_KEY) || '{}');
+    meta[key] = { src, cached: !!cached, savedAt: Date.now() };
+    localStorage.setItem(ASSET_META_KEY, JSON.stringify(meta));
+  } catch (e) {
+    // Game tetap bisa berjalan meskipun penyimpanan metadata diblokir/penuh.
+  }
+}
+
+function imageFromBlob(key, blob) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => {
+      IMG[key] = im;
+      URL.revokeObjectURL(objectUrl);
+      resolve(im);
+    };
+    im.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Gambar tidak dapat dibaca: ' + key));
+    };
+    im.src = objectUrl;
+  });
+}
+
+function imageDirect(key, src) {
+  return new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => { IMG[key] = im; resolve(im); };
+    im.onerror = () => reject(new Error('Gagal memuat: ' + src));
+    im.src = src;
+  });
+}
+
+function fallbackAsset(key) {
+  // Placeholder mencegah drawImage error jika file aset memang tidak tersedia.
+  const c = document.createElement('canvas');
+  c.width = 160; c.height = 160;
+  const g = c.getContext('2d');
+  g.fillStyle = '#1e293b'; g.fillRect(0, 0, c.width, c.height);
+  g.strokeStyle = '#64748b'; g.lineWidth = 5; g.strokeRect(5, 5, 150, 150);
+  g.fillStyle = '#e2e8f0'; g.font = 'bold 18px sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const label = key.slice(0, 16);
+  g.fillText(label, 80, 80, 138);
+  IMG[key] = c;
+}
+
+async function loadOneAsset(item, cache) {
+  const { key, src } = item;
+  const url = new URL(src, document.baseURI).href;
+  try {
+    let response = cache ? await cache.match(url) : null;
+    if (response) {
+      item.status = 'Dari cache';
+      await imageFromBlob(key, await response.blob());
+      assetProgress.fromCache++;
+      saveAssetMeta(key, src, true);
+      return;
+    }
+
+    item.status = cache ? 'Mengunduh...' : 'Memuat...';
+    if (cache) {
+      response = await fetch(url);
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      // Simpan respons sebelum mengubahnya menjadi Blob untuk elemen Image.
+      await cache.put(url, response.clone());
+      await imageFromBlob(key, await response.blob());
+      item.status = 'Diunduh + disimpan';
+      assetProgress.saved++;
+      saveAssetMeta(key, src, true);
+    } else {
+      // Fallback untuk file:// atau browser yang tidak mendukung Cache Storage.
+      await imageDirect(key, src);
+      item.status = 'Dimuat (tanpa cache)';
+      saveAssetMeta(key, src, false);
+    }
+  } catch (err) {
+    // Fallback direct image: tetap coba tampilkan aset walau cache/fetch gagal.
+    try {
+      item.status = 'Coba ulang...';
+      await imageDirect(key, src);
+      item.status = 'Dimuat (cache gagal)';
+      saveAssetMeta(key, src, false);
+    } catch (fallbackError) {
+      item.status = 'Gagal dimuat';
+      fallbackAsset(key);
+      console.warn('[Aset]', key, fallbackError);
+    }
+  } finally {
+    item.done = true;
+    assetProgress.done++;
+    loadedCount = assetProgress.done;
+  }
+}
+
+async function loadAssets() {
+  let cache = null;
+  if ('caches' in window && location.protocol !== 'file:') {
+    try { cache = await caches.open(ASSET_CACHE_NAME); }
+    catch (e) { console.warn('Cache Storage tidak tersedia:', e); }
+  }
+
+  // Semua gambar dimuat paralel agar loading tidak terlalu lama.
+  await Promise.all(assetProgress.items.map(item => loadOneAsset(item, cache)));
+  assetsReady = true;
+}
+
+// Mulai render sejak awal agar layar loading langsung terlihat.
+start();
 
 const SPK = { 'Vin':'vin', 'Mbak Ratna':'mbak-ratna', 'Pak Slamet':'pak-slamet', 'Pak Hadi':'pak-hadi', 'Bu Dewi':'bu-dewi', 'Dimas':'dimas', 'Sari':'sari' };
 const PERS = {
@@ -1130,9 +1260,65 @@ function drawRotate() {
   ctx.fillText('Supaya layar penuh dan mudah dimainkan', S.view.w / 2, S.view.h / 2 + 20);
 }
 
+function drawLoadingScreen() {
+  const v = S.view;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#050814'; ctx.fillRect(0, 0, v.w, v.h);
+
+  const progress = assetProgress.total ? assetProgress.done / assetProgress.total : 1;
+  const pct = Math.round(progress * 100);
+  const panelW = Math.min(900, v.w - 36);
+  const panelX = (v.w - panelW) / 2;
+  const panelY = Math.max(12, (v.h - 500) / 2);
+  const scale = Math.min(1, panelW / 900, (v.h - 24) / 500);
+
+  ctx.save();
+  ctx.translate(panelX, panelY);
+  ctx.scale(scale, scale);
+  ctx.fillStyle = '#0f172a'; rr(0, 0, 900, 500, 22); ctx.fill();
+  ctx.strokeStyle = '#334155'; ctx.lineWidth = 2; rr(0, 0, 900, 500, 22); ctx.stroke();
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 30px ' + FONT;
+  ctx.fillText('Menyiapkan Pasar Malam Dandangan', 450, 22);
+  ctx.fillStyle = '#94a3b8'; ctx.font = '15px ' + FONT;
+  ctx.fillText('Memeriksa cache dan memuat gambar permainan...', 450, 62);
+
+  ctx.fillStyle = '#1e293b'; rr(40, 96, 820, 18, 9); ctx.fill();
+  ctx.fillStyle = '#38bdf8'; rr(40, 96, 820 * progress, 18, 9); ctx.fill();
+  ctx.textAlign = 'left'; ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 16px ' + FONT;
+  ctx.fillText(pct + '%  •  ' + assetProgress.done + ' / ' + assetProgress.total + ' gambar', 40, 124);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#94a3b8'; ctx.font = '14px ' + FONT;
+  ctx.fillText(assetProgress.fromCache + ' dari cache  |  ' + assetProgress.saved + ' baru disimpan', 860, 126);
+
+  const colW = 410;
+  assetProgress.items.forEach((item, i) => {
+    const col = i < 17 ? 0 : 1;
+    const row = i < 17 ? i : i - 17;
+    const x = 40 + col * 420;
+    const y = 158 + row * 19;
+    const good = item.status === 'Dari cache' || item.status === 'Diunduh + disimpan' || item.status === 'Dimuat (tanpa cache)' || item.status === 'Dimuat (cache gagal)';
+    const failed = item.status === 'Gagal dimuat';
+    ctx.fillStyle = '#1e293b'; rr(x, y, colW, 16, 5); ctx.fill();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.font = '12px ' + FONT;
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillText(assetLabel(item.key), x + 8, y + 8, 240);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = failed ? '#fca5a5' : good ? '#86efac' : '#fcd34d';
+    ctx.fillText(item.status, x + colW - 8, y + 8, 155);
+  });
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  ctx.fillStyle = '#64748b'; ctx.font = '12px ' + FONT;
+  ctx.fillText('Gambar yang tersimpan akan digunakan kembali saat kamu membuka game berikutnya.', 450, 485);
+  ctx.restore();
+}
+
 function render() {
   const v = S.view;
   S.buttons = [];
+  if (!assetsReady) { drawLoadingScreen(); return; }
   if (isPortrait()) { drawScreenBG('bg-gerbang-pasmal', 0.6); drawRotate(); return; }
 
   const sc = S.scene === 'menu' ? null : S.sc;
@@ -1222,7 +1408,12 @@ function frame(t) {
   render();
   requestAnimationFrame(frame);
 }
-function start() { loadProgress(); loadSettings(); requestAnimationFrame(frame); }
+function start() {
+  loadProgress();
+  loadSettings();
+  requestAnimationFrame(frame);
+  loadAssets();
+}
 
 /* ================= INPUT: MOUSE, SENTUH, KEYBOARD ================= */
 function pos(e) {
